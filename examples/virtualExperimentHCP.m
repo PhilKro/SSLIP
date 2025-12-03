@@ -21,9 +21,11 @@ close all
 
 addpath(fullfile(pwd,'..','src'));
 
-setMTEXpref('xAxisDirection','east');
-setMTEXpref('zAxisDirection','intoplane');
+plotx2east
+plotzIntoPlane
 
+plottingConvention.default.east = xvector;
+plottingConvention.default.outOfScreen = -zvector; 
 %% define a crystal orientation and slip systems
 
 % HCP crystal symmetry
