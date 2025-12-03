@@ -261,9 +261,6 @@ V = ebsd.prop.U.y;
 %%% save the results in a matfile
 save(optOut.plotname,'ebsdID','sSLocal','optOut');
 
-
-
-
 % plot one activity field (system 3), just to demonstrate how data is
 % structured
 figure;
