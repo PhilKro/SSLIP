@@ -94,4 +94,49 @@ ebsdID.prop.Hxx = Hxx; ebsdID.prop.Hxy = Hxy;
 ebsdID.prop.Hyx = Hyx; ebsdID.prop.Hyy = Hyy;
 ebsdID.prop.Eeff = prepData.Eeff;
 
+% -------------------------------------------------------------------------
+% Precompute the EXACT 1-to-1 mathematical upscaling mapping!
+% By computing this here, we completely isolate all downstream scripts 
+% from ANY spatial math, cropping logic, or grid reshaping!
+% -------------------------------------------------------------------------
+if isfield(crs, 'sps') && crs.sps > 1
+    In = crs.In_bounds;
+    Im = crs.Im_bounds;
+    sps = crs.sps;
+    
+    % The original exact MTEX .id values of the un-cropped region (using global_id if stashed)
+    if isfield(ebsd.prop, 'global_id')
+        id_kept = ebsd.prop.global_id(In, Im);
+    else
+        id_kept = ebsd.id(In, Im);
+    end
+    
+    % The grid size of the low-res solver
+    n_lr = length(In) / sps;
+    m_lr = length(Im) / sps;
+    
+    % A 2D grid representing the native 1D linear memory indices of the low-res solver
+    idx_lr_grid = reshape(1:(n_lr * m_lr), n_lr, m_lr);
+    
+    % Upscale the index grid perfectly using the superpixel size
+    idx_upscaled = repelem(idx_lr_grid, sps, sps);
+    
+    % Filter out invalid/NaN IDs just to be safe
+    valid = ~isnan(id_kept(:)) & (id_kept(:) > 0);
+    
+    % Attach the perfectly aligned 1D lookup tables to the object!
+    ebsdID.prop.upscale_id_hr = id_kept(valid);
+    ebsdID.prop.upscale_idx_lr = idx_upscaled(valid);
+else
+    % If no coarsegraining was applied, the mapping is just 1-to-1 identity
+    if isfield(ebsd.prop, 'global_id')
+        id_full = ebsd.prop.global_id;
+    else
+        id_full = ebsd.id;
+    end
+    valid = ~isnan(id_full(:)) & (id_full(:) > 0);
+    ebsdID.prop.upscale_id_hr = id_full(valid);
+    ebsdID.prop.upscale_idx_lr = find(valid);
+end
+
 end

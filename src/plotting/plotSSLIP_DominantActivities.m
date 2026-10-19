@@ -20,6 +20,7 @@ if ~isfield(opt, 'num_top_systems'),    opt.num_top_systems = 3; end      % Numb
 if ~isfield(opt, 'sizeAdjust'),         opt.sizeAdjust = 1; end           % Scale factor for MTEX figure layout spacing
 if ~isfield(opt, 'plotGrainContext'),   opt.plotGrainContext = 0; end     % Flag (0/1): Overlay grain boundaries (requires opt.grains to be set)
 if ~isfield(opt, 'ori'),                opt.ori = []; end                 % Orientation object used to recover crystal coordinates from specimen coordinates (inv(ori)*sSLocal)
+if ~isfield(opt, 'quiverLengthFactor'), opt.quiverLengthFactor = 0.2; end % Scaling factor for trace and burgers quivers
 
 % Output / Export Options
 if ~isfield(opt, 'saveFig'),            opt.saveFig = 0; end              % Flag (0/1): Save the resulting figure to disk
@@ -34,7 +35,7 @@ if ~isfield(opt, 'activityPercentile'), opt.activityPercentile = 85; end  % The 
 if ~isfield(opt, 'enableRotation'),     opt.enableRotation = 0; end       % Flag (0/1): Should be 1 if solving included pseudo-slip rigid body rotations
 if ~isfield(opt, 'normalizeInplane'),   opt.normalizeInplane = 0; end     % Flag (0/1): Normalize the 2D deformation gradients prior to similarity checking
 
-bundleAngleThresh = 1e-5; % Hardcoded strict threshold for crystallographic equivalence (angle between normal and burgers vectors)
+% bundleAngleThresh = 1e-5; % Hardcoded strict threshold for crystallographic equivalence (angle between normal and burgers vectors)
 % =========================================================================
 
 % =========================================================================
@@ -91,126 +92,19 @@ if isfield(opt, 'normalizeInplane') && opt.normalizeInplane
     A_mat = A_mat ./ sqrt(sum(A_mat.^2, 1));
 end
 
-% Rank systems by percentile activity (robust to outliers, sensitive to bands)
-gamma_abs = abs(ebsdID.prop.slipIDcor);
-num_sys = size(gamma_abs, 2);
-metric_vals = zeros(1, num_sys);
-for i = 1:num_sys
-    valid_g = gamma_abs(:, i);
-    valid_g = valid_g(~isnan(valid_g) & ~isinf(valid_g));
-    if isempty(valid_g)
-        metric_vals(i) = 0;
-    else
-        metric_vals(i) = prctile(valid_g, opt.activityPercentile);
+% Rank systems by percentile activity and form bundles using utility function
+opt_bundle = opt; % Pass down all options
+[bundles, metric_vals, leftover_idx] = bundleSSLIPSystems(ebsdID, sSLocal, opt_bundle);
+
+% Enforce the maximum number of top systems requested
+n_top = min(length(bundles), opt.num_top_systems);
+if length(bundles) > n_top
+    for idx = n_top+1:length(bundles)
+        leftover_idx = [leftover_idx, bundles{idx}];
     end
+    bundles(n_top+1:end) = [];
 end
 
-[sort_metric_acts, sort_sys_idx] = sort(metric_vals, 'descend');
-
-% Form bundles
-bundles = {}; % cell array of system indices
-rep_sys_list = []; % Array of representative system indices for fast vectorization
-leftover_idx = [];
-
-if opt.bundleSimilar
-    for i = 1:length(sort_sys_idx)
-        sys_i = sort_sys_idx(i);
-        
-        % Check if the current system's activity is below the threshold.
-        % If so, it doesn't qualify for its own bundle and gets dumped into 'leftover'.
-        if metric_vals(sys_i) < opt.activityThreshold
-            leftover_idx = [leftover_idx, sys_i];
-            continue;
-        end
-        
-        % We will attempt to match this system against all PREVIOUSLY created bundles.
-        % 'matched_bundle' will store the index of the bundle we match with (if any).
-        matched_bundle = 0;
-        
-        % We can only bundle true crystallographic slip systems (sys_i <= length(sSLocal)).
-        % We cannot bundle 'rotation' pseudo-systems because they lack normals/burgers vectors.
-        if ~isempty(rep_sys_list) && sys_i <= length(sSLocal)
-            
-            % 'rep_sys_list' tracks the first (representative) system of every existing bundle.
-            % We must filter out any pseudo-slip systems (like rotation) from this list 
-            % before attempting crystallographic comparisons.
-            % 'valid_reps_mask' is a logical array mapping which bundles are valid crystallographic systems.
-            valid_reps_mask = rep_sys_list <= length(sSLocal);
-            
-            % 'valid_reps' extracts only the system indices of valid crystallographic bundles.
-            % This prevents indexing out of bounds when calling sSLocal(valid_reps) below.
-            valid_reps = rep_sys_list(valid_reps_mask);
-            
-            if ~isempty(valid_reps)
-                % Vectorized Condition A: Crystallographic Equivalence
-                % Can only be computed if a opt.ori is provided to cast b
-                % and n to crystal coordinates. Otherwise set to true.
-                if ~isempty(opt.ori)
-                    % The normal (n) and burgers (b) vectors must be parallel to the bundle representative.
-                    n_i = sys_n_miller(sys_i);
-                    b_i = sys_b_miller(sys_i);
-                    n_reps = sys_n_miller(valid_reps);
-                    b_reps = sys_b_miller(valid_reps);
-
-                    ang_n = angle(n_i, n_reps);
-                    ang_b = angle(b_i, b_reps);
-                    cond_A = (ang_n(:)' < bundleAngleThresh) & (ang_b(:)' < bundleAngleThresh);
-                else
-                    warning('plotSSLIP_DominantActivities:missingOrientationForClustering','No orientaiton provided. Clustering of slip system activities will be done solely on the similarity of projected def grads.')
-                    cond_A = true(size(valid_reps));
-                end
-                % Vectorized Condition B: 2D Projection Similarity
-                % The 2D projected strain tensor (Hxx, Hxy, Hyx, Hyy) must be very similar.
-                % norm1 tests for identical direction, norm2 tests for anti-parallel direction.
-                A_i = A_mat(:, sys_i);
-                A_reps = A_mat(:, valid_reps);
-                norm1 = sqrt(sum((A_reps - A_i).^2, 1));
-                norm2 = sqrt(sum((A_reps + A_i).^2, 1));
-                cond_B = (norm1 < opt.bundleStrainThresh) | (norm2 < opt.bundleStrainThresh);
-                
-                % Find the first valid bundle where BOTH conditions are met.
-                match_local_idx = find(cond_A & cond_B, 1);
-                
-                if ~isempty(match_local_idx)
-                    % Because we filtered out pseudo-systems, 'match_local_idx' points to the 
-                    % position in the *filtered* list. We use valid_bundle_indices to map this 
-                    % back to the true original index in the global 'bundles' cell array.
-                    valid_bundle_indices = find(valid_reps_mask);
-                    matched_bundle = valid_bundle_indices(match_local_idx);
-                end
-            end
-        end
-        
-        if matched_bundle > 0
-            % We found a matching bundle! Add this system to it.
-            bundles{matched_bundle}(end+1) = sys_i;
-        else
-            % No match was found, so we must create a NEW bundle.
-            % However, we only track up to 'num_top_systems' bundles.
-            if length(bundles) < opt.num_top_systems
-                bundles{length(bundles)+1} = sys_i;
-                rep_sys_list(end+1) = sys_i; % Register this system as the representative for the new bundle
-            else
-                % If we hit our maximum number of allowed bundles, everything else falls to leftover.
-                leftover_idx = [leftover_idx, sys_i];
-            end
-        end
-    end
-else
-    % No bundling: just take top N active systems above threshold
-    for i = 1:length(sort_sys_idx)
-        sys_i = sort_sys_idx(i);
-        if length(bundles) < opt.num_top_systems && metric_vals(sys_i) >= opt.activityThreshold
-            bundles{end+1} = sys_i;
-        else
-            leftover_idx = [leftover_idx, sys_i];
-        end
-    end
-end
-
-n_top = length(bundles);
-
-% Calculate Leftover activity map
 leftover_activity = zeros(size(ebsdID.prop.slipIDcor, 1), 1);
 for i = 1:length(leftover_idx)
     leftover_activity = leftover_activity + ebsdID.prop.slipIDcor(:, leftover_idx(i));
@@ -329,8 +223,8 @@ for t_i = 1:n_top
         % Quiver trace and slip direction
         sys_obj.b.z = sys_obj.b.z .* sign(sys_obj.b.z) * sign(plottingConvention.default.outOfScreen.z);
         ebsdTrace = ebsdID(round(size(ebsdID,1)/2), round(size(ebsdID,2)/2));
-        quiver_scale = 0.2 * (max(ebsdID.x,[],'all') - min(ebsdID.x,[],'all'));
-        hold on; quiver(ebsdTrace, quiver_scale * sys_obj.trace, 'color', 'r', 'linewidth', 1.5);
+        quiver_scale = opt.quiverLengthFactor * (max(ebsdID.x,[],'all') - min(ebsdID.x,[],'all'));
+        hold on; quiver(ebsdTrace, quiver_scale * sys_obj.trace, 'color', 'r', 'linewidth', 1.5, 'ShowArrowHead', 'off');
         hold on; quiver(ebsdTrace, quiver_scale * sys_obj.b.normalize, 'color', 'r', 'linewidth', 1.5);
         hold off;
         

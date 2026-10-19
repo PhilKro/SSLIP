@@ -22,6 +22,12 @@ In = floor(1+nmod/2):(n-(nmod-floor(nmod/2)));
 mmod = mod(m,crs.sps);
 Im = floor(1+mmod/2):(m-(mmod-floor(mmod/2)));
 
+% Save the original spatial dimensions and crop boundaries for mathematical reversion
+crs.original_n = n;
+crs.original_m = m;
+crs.In_bounds = In;
+crs.Im_bounds = Im;
+
 % crop
 f = f(In,Im);
 g = g(In,Im);

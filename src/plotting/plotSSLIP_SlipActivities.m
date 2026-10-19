@@ -23,6 +23,7 @@ if ~isfield(opt, 'NoSs'),               opt.NoSs = 1:length(sSLocal); end % Arra
 if ~isfield(opt, 'sizeAdjust'),         opt.sizeAdjust = 1; end           % Scale factor for MTEX figure layout spacing
 if ~isfield(opt, 'plotGrainContext'),   opt.plotGrainContext = 0; end     % Flag (0/1): Overlay grain boundaries (requires opt.grains to be set)
 if ~isfield(opt, 'ori'),                opt.ori = []; end                 % Orientation object used to recover crystal coordinates from specimen coordinates (inv(ori)*sSLocal)
+if ~isfield(opt, 'quiverLengthFactor'), opt.quiverLengthFactor = 0.2; end % Scaling factor for trace and burgers quivers
 
 % Output / Export Options
 if ~isfield(opt, 'saveFig'),            opt.saveFig = 0; end              % Flag (0/1): Save the resulting figure(s) to disk
@@ -65,12 +66,12 @@ for i = 1:num_total_sys
         sys_bx(i) = sys_rep_b.u; sys_by(i) = sys_rep_b.v; sys_bz(i) = sys_rep_b.w;
         sys_n_miller(i) = sys_rep_n;
         sys_b_miller(i) = sys_rep_b;
-        sys_strings{i} = sprintf('n=(%d,%d,%d) b=[%d,%d,%d]', sys_nx(i), sys_ny(i), sys_nz(i), sys_bx(i), sys_by(i), sys_bz(i));
+        sys_strings{i} = sprintf('(%.0f %.0f %.0f)[%.0f %.0f %.0f]', sys_nx(i), sys_ny(i), sys_nz(i), sys_bx(i), sys_by(i), sys_bz(i));
     else
         sys_rep = obj;
         sys_nx(i) = sys_rep.n.x; sys_ny(i) = sys_rep.n.y; sys_nz(i) = sys_rep.n.z;
         sys_bx(i) = sys_rep.b.x; sys_by(i) = sys_rep.b.y; sys_bz(i) = sys_rep.b.z;
-        sys_strings{i} = sprintf('n=(%.2f,%.2f,%.2f) b=[%.2f,%.2f,%.2f]', sys_nx(i), sys_ny(i), sys_nz(i), sys_bx(i), sys_by(i), sys_bz(i));
+        sys_strings{i} = sprintf('(%.2f, %.2f, %.2f)[%.2f, %.2f, %.2f]', sys_nx(i), sys_ny(i), sys_nz(i), sys_bx(i), sys_by(i), sys_bz(i));
     end
 end
 % =========================================================================
@@ -81,8 +82,7 @@ slipIDcor = ebsdID.prop.slipIDcor;
 SF = abs(SchmidFactor(sSLocal(NoSs), opt.stress));
 SF = round(SF*100)/100;
 
-% make sure slip directions are plotted above the activity fields
-sSLocal.b.z = sSLocal.b.z .* sign(sSLocal.b.z) * sign(plottingConvention.default.outOfScreen.z);
+% (Global Z-flip hack removed to prevent corrupting Schmid Factor calculations for 3D stress tensors)
 
 if opt.bundleSimilar
     Hslip = sSLocal.deformationTensor.matrix;
@@ -246,149 +246,139 @@ if opt.logscale && ~opt.posConstr
     warning('Since logaritmic plotting is required (opt.logscale==1), while pos. constr. was not used (opt.posConstr==0), absolute values of slip activities are plotted')
 end
 
-maxFields = 24;
 caxisMinMax = [0 0];
+validData = slipIDcor(~isinf(slipIDcor) & ~isnan(slipIDcor));
+
+if ~isempty(opt.custom_clim)
+    caxisMinMax = opt.custom_clim;
+else
+    if opt.logscale || isfield(opt,'logmin')
+        caxisMinMax(1) = opt.logmin;
+    elseif opt.posConstr == 1
+        caxisMinMax(1) = 0;
+    elseif isfield(opt,'maxE')
+        caxisMinMax(1) = -opt.maxE;
+    else
+        caxisMinMax(1) = prctile(validData, 100 - opt.clim_percentile);
+    end
+    
+    if isfield(opt,'maxE')
+        caxisMinMax(2) = opt.maxE;
+    else
+        caxisMinMax(2) = prctile(validData, opt.clim_percentile);
+    end
+    
+    if isempty(caxisMinMax(2)) || isnan(caxisMinMax(2)), caxisMinMax(2) = 0.05; end
+    if caxisMinMax(2) <= caxisMinMax(1)
+        if opt.logscale && caxisMinMax(1) > 0
+            caxisMinMax(2) = caxisMinMax(1) * 10;
+        else
+            caxisMinMax(2) = caxisMinMax(1) + 0.05;
+        end
+    end
+end
 
 if ~opt.plotSingle
+    % Calculate physical aspect ratio of the map
+    % dx/dy < 1 means it's slender (tall). dx/dy > 1 means it's wide.
+    dx = max(ebsdID.x, [], 'all') - min(ebsdID.x, [], 'all');
+    dy = max(ebsdID.y, [], 'all') - min(ebsdID.y, [], 'all');
+    map_ar = dx / dy;
+    
+    % Dynamic Geometry-Aware Layout Generator
     if isempty(opt.layout)
-        figure; f1=newMtexFigure;
+        if map_ar < 0.4
+            % Extremely slender (Tall/Thin) -> Force 1 column to give titles infinite horizontal space
+            layout = [2, 1]; % 2 plots per page
+        elseif map_ar < 0.8
+            % Slender -> Max 2 columns
+            layout = [2, 2]; % 4 plots per page
+        elseif map_ar > 2.5
+            % Extremely wide (Short/Fat) -> Force 1 column, but many rows
+            layout = [4, 1]; % 4 plots per page
+        elseif map_ar > 1.5
+            % Wide -> Max 2 columns, 3 rows
+            layout = [3, 2]; % 6 plots per page
+        else
+            % Square-ish -> 3x3 grid is safe
+            layout = [3, 3]; % 9 plots per page
+        end
     else
-        figure; f1=newMtexFigure('layout',opt.layout);
+        layout = opt.layout;
     end
     
-    for i = 1:min([length(NoSs) , maxFields])
-        nextAxis
-        plotSSLIP_Context(opt);
-        ha(i) = plot(ebsdID, slipIDcor(:,i),'micronbar','off' ); 
-        sys_obj = sSLocal(NoSs(i));
-        sys_str = sys_strings{NoSs(i)};
-        
-        if bundled_count(i) > 1
-            title(sprintf('[Bundle %d] #%d %s\n%d systems | SF=%.2f', i, NoSs(i), sys_str, bundled_count(i), SF(i)));
-        else
-            title(sprintf('[Top %d] #%d %s | SF=%.2f', i, NoSs(i), sys_str, SF(i)));
-        end
-        
-        if opt.plotTraces
-            ebsdTrace = ebsdID(round(size(ebsdID,1)/2),round(size(ebsdID,2)/2));
-            hold on
-            quiver(ebsdTrace,0.2*(max(ebsdID.x,[],'all')-min(ebsdID.x,[],'all')) * sSLocal(NoSs(i)).trace,'color','r');
-            quiver(ebsdTrace,0.2*(max(ebsdID.x,[],'all')-min(ebsdID.x,[],'all')) * sSLocal(NoSs(i)).b.normalize,'color','r');
-            hold off
-        end
-    end
+    max_per_page = layout(1) * layout(2);
+    num_pages = ceil(length(NoSs) / max_per_page);
     
-    validData = slipIDcor(~isinf(slipIDcor) & ~isnan(slipIDcor));
-    
-    if ~isempty(opt.custom_clim)
-        caxisMinMax = opt.custom_clim;
-    else
-        if opt.logscale || isfield(opt,'logmin')
-            caxisMinMax(1) = opt.logmin;
-        elseif opt.posConstr == 1
-            caxisMinMax(1) = 0;
-        elseif isfield(opt,'maxE')
-            caxisMinMax(1) = -opt.maxE;
-        else
-            caxisMinMax(1) = prctile(validData, 100 - opt.clim_percentile);
-        end
+    for page = 1:num_pages
+        sys_start = (page - 1) * max_per_page + 1;
+        sys_end = min(page * max_per_page, length(NoSs));
+        num_on_page = sys_end - sys_start + 1;
         
-        if isfield(opt,'maxE')
-            caxisMinMax(2) = opt.maxE;
-        else
-            caxisMinMax(2) = prctile(validData, opt.clim_percentile);
-        end
+        figure; f1 = newMtexFigure('layout', layout);
         
-        if isempty(caxisMinMax(2)) || isnan(caxisMinMax(2)), caxisMinMax(2) = 0.05; end
-        if caxisMinMax(2) <= caxisMinMax(1)
-            if opt.logscale && caxisMinMax(1) > 0
-                caxisMinMax(2) = caxisMinMax(1) * 10;
-            else
-                caxisMinMax(2) = caxisMinMax(1) + 0.05;
-            end
-        end
-    end
-
-    for i=1:min([length(NoSs) , maxFields])
-        ha(i).Parent.CLim = caxisMinMax;
-        if opt.logscale
-            ha(i).Parent.ColorScale = 'log';
-        end
-    end
-
-    mtexColorMap(opt.cmap)
-    if opt.logscale && ~opt.posConstr
-        mtexColorbar('title','|\gamma|')
-    else
-        mtexColorbar('title','\gamma')
-    end
-    
-    if isfield(opt,'sizeAdjust')
-        f1.figSizeFactor = opt.sizeAdjust;
-        f1.innerPlotSpacing = f1.innerPlotSpacing * opt.sizeAdjust;
-        f1.drawNow;
-    end
-    
-    if opt.saveFig && isfield(opt, 'plotname') && ~isempty(opt.plotname)
-        saveFigure([opt.plotname, '_SlipActivities.png'])
-        if isfield(opt,'saveExt')
-            saveFigure([opt.plotname, '_SlipActivities', opt.saveExt])
-        end
-    end
-
-    % If more than 24
-    if length(NoSs) > maxFields
-        if isempty(opt.layout)
-            figure; f2=newMtexFigure;
-        else
-            figure; f2=newMtexFigure('layout',opt.layout);
-        end
-        
-        for i = maxFields+1 : length(NoSs)
-            nextAxis
-            plotSSLIP_Context(opt);
-            ha2(i-maxFields) = plot(ebsdID, slipIDcor(:,i),'micronbar','off' ); 
-            sys_obj = sSLocal(NoSs(i));
-            sys_str = sys_strings{NoSs(i)};
+        clear ha; % clear axis handles for this page
+        for p_i = 1:num_on_page
+            idx = sys_start + p_i - 1;
+            sys_i = NoSs(idx);
             
-            if bundled_count(i) > 1
-                title(sprintf('[Bundle %d] #%d %s\n%d systems | SF=%.2f', i, NoSs(i), sys_str, bundled_count(i), SF(i)));
+            nextAxis;
+            plotSSLIP_Context(opt);
+            ha(p_i) = plot(ebsdID, slipIDcor(:, sys_i), 'micronbar', 'off'); 
+            
+            sys_str = sys_strings{sys_i};
+            
+            % Multi-line typography with fixed font size for vertical stacking
+            if bundled_count(idx) > 1
+                title(sprintf('Bundle %d (Sys %d)\n%s | SF=%.2f', idx, sys_i, sys_str, SF(idx)), 'FontSize', 10, 'FontWeight', 'normal');
             else
-                title(sprintf('[Top %d] #%d %s | SF=%.2f', i, NoSs(i), sys_str, SF(i)));
+                title(sprintf('Sys %d\n%s | SF=%.2f', sys_i, sys_str, SF(idx)), 'FontSize', 10, 'FontWeight', 'normal');
             end
+            
             if opt.plotTraces
-                ebsdTrace = ebsdID(round(size(ebsdID,1)/2),round(size(ebsdID,2)/2));
+                ebsdTrace = ebsdID(round(size(ebsdID,1)/2), round(size(ebsdID,2)/2));
                 hold on
-                quiver(ebsdTrace,0.2*(max(ebsdID.x,[],'all')-min(ebsdID.x,[],'all')) * sSLocal(NoSs(i)).trace,'color','r');
-                quiver(ebsdTrace,0.2*(max(ebsdID.x,[],'all')-min(ebsdID.x,[],'all')) * sSLocal(NoSs(i)).b.normalize,'color','r');
+                trace_len = opt.quiverLengthFactor*(max(ebsdID.x,[],'all')-min(ebsdID.x,[],'all'));
+                quiver(ebsdTrace, trace_len * sSLocal(sys_i).trace, 'color', 'r', 'ShowArrowHead', 'off');
+                b_plot = sSLocal(sys_i).b.normalize;
+                b_plot.z = b_plot.z .* sign(b_plot.z) * sign(plottingConvention.default.outOfScreen.z);
+                quiver(ebsdTrace, trace_len * b_plot, 'color', 'r');
                 hold off
             end
-        end
-        
-        for i=1:length(NoSs)-maxFields
-            ha2(i).Parent.CLim = caxisMinMax;
+            
+            % Apply color limits per subplot directly
+            ha(p_i).Parent.CLim = caxisMinMax;
             if opt.logscale
-                ha2(i).Parent.ColorScale = 'log';
+                ha(p_i).Parent.ColorScale = 'log';
             end
         end
-
-        mtexColorMap(opt.cmap)
+        
+        mtexColorMap(opt.cmap);
         if opt.logscale && ~opt.posConstr
-            mtexColorbar('title','|\gamma|')
+            mtexColorbar('title', '|\gamma|');
         else
-            mtexColorbar('title','\gamma')
+            mtexColorbar('title', '\gamma');
         end
         
+        % Force massive spacing improvements to guarantee no title overlap
+        f1.innerPlotSpacing = 100; % Increased to 100 pixels to physically force axes apart vertically
         if isfield(opt,'sizeAdjust')
-            f2.figSizeFactor = opt.sizeAdjust;
-            f2.innerPlotSpacing = f2.innerPlotSpacing * opt.sizeAdjust;
-            f2.drawNow;
+            f1.figSizeFactor = opt.sizeAdjust;
+            f1.innerPlotSpacing = f1.innerPlotSpacing * opt.sizeAdjust;
         end
+        f1.drawNow;
         
         if opt.saveFig && isfield(opt, 'plotname') && ~isempty(opt.plotname)
-            saveFigure([opt.plotname, '_SlipActivities_24plus.png'])
-            if isfield(opt,'saveExt')
-                saveFigure([opt.plotname, '_SlipActivities_24plus',opt.saveExt])
+            if num_pages > 1
+                saveFigure([opt.plotname, sprintf('_SlipActivities_Page%d.png', page)])
+                if isfield(opt,'saveExt')
+                    saveFigure([opt.plotname, sprintf('_SlipActivities_Page%d', page), opt.saveExt])
+                end
+            else
+                saveFigure([opt.plotname, '_SlipActivities.png'])
+                if isfield(opt,'saveExt')
+                    saveFigure([opt.plotname, '_SlipActivities', opt.saveExt])
+                end
             end
         end
     end
@@ -441,15 +431,17 @@ else
         sys_str = sys_strings{NoSs(i)};
         
         if bundled_count(i) > 1
-            title(sprintf('[Bundle %d] #%d %s\n%d systems | SF=%.2f', i, NoSs(i), sys_str, bundled_count(i), SF(i)));
+            title(sprintf('Bundle %d (Sys %d)\n%s | SF=%.2f', i, NoSs(i), sys_str, SF(i)), 'Interpreter', 'none');
         else
-            title(sprintf('[Top %d] #%d %s | SF=%.2f', i, NoSs(i), sys_str, SF(i)));
+            title(sprintf('Sys %d\n%s | SF=%.2f', NoSs(i), sys_str, SF(i)), 'Interpreter', 'none');
         end
         if opt.plotTraces
             ebsdTrace = ebsdID(round(size(ebsdID,1)/2),round(size(ebsdID,2)/2));
-            hold on
-            quiver(ebsdTrace,0.2*(ebsdID.xmax-ebsdID.xmin) * sSLocal(NoSs(i)).trace,'color','r','linewidth',5);
-            quiver(ebsdTrace,0.2*(ebsdID.xmax-ebsdID.xmin) * sSLocal(NoSs(i)).b.normalize,'color','r','linewidth',5);
+            trace_len = opt.quiverLengthFactor*(ebsdID.xmax-ebsdID.xmin);
+            quiver(ebsdTrace, trace_len * sSLocal(NoSs(i)).trace, 'color', 'r', 'linewidth', 5, 'ShowArrowHead', 'off');
+            b_plot = sSLocal(NoSs(i)).b.normalize;
+            b_plot.z = b_plot.z .* sign(b_plot.z) * sign(plottingConvention.default.outOfScreen.z);
+            quiver(ebsdTrace, trace_len * b_plot, 'color', 'r', 'linewidth', 5);
             hold off
         end
         
